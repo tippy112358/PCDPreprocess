@@ -1,0 +1,18 @@
+{
+  "installation": {
+    "lidar_id": "LDR",
+    "extrinsics": {
+      "calibration_time": "",
+      "calibration_engineer": "",
+      "calibration_run": "",
+      "calibration_mode": "",
+      "x": 0.0,
+      "y": 1.7,
+      "z": 1.424,
+      "yaw": 0.01528389277411581,
+      "pitch": 0.42422315514624154,
+      "roll": 0.009581188416559007,
+      "vehicle_name": ""
+    }
+  }
+}

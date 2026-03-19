@@ -1,0 +1,1029 @@
+import torch
+import os
+import pandas as pd
+import numpy as np
+import cv2
+import json
+import time
+import random
+import glob
+import open3d as o3d
+import open3d.visualization.rendering as rendering
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+from torchvision.transforms import v2
+import torchvision
+from einops import rearrange
+from typing import List, Dict, Optional, Tuple
+from collections import defaultdict
+
+
+# ============================================================
+#  Camera 工具 (保留原始接口)
+# ============================================================
+
+class Camera(object):
+    def __init__(self, c2w):
+        c2w = np.linalg.inv(np.array(c2w).reshape(4, 4))
+        c2w[:3, 3] *= 1.5
+        swap_axes = np.array([
+            [0, 0, -1, 0],
+            [0, 1, 0, 0],
+            [-1, 0, 0, 0],
+            [0, 0, 0, 1]
+        ])
+        c2w = swap_axes @ c2w @ np.linalg.inv(swap_axes)
+        self.c2w_mat = c2w
+        self.w2c_mat = np.linalg.inv(c2w)
+
+
+# ============================================================
+#  CPU 点云 Splat 渲染器
+# ============================================================
+
+class CPUPointCloudRenderer:
+    """
+    CPU 上的点云 Splat 渲染器
+    点云常驻内存，每次只做投影 + scatter
+    """
+
+    def __init__(self, ply_path: str, max_points: int = None):
+        """
+        Args:
+            ply_path: 着色 PLY 路径
+            max_points: 最大点数，超过则体素下采样
+        """
+        t0 = time.time()
+        pcd = o3d.io.read_point_cloud(ply_path)
+
+        if max_points and len(pcd.points) > max_points:
+            points = np.asarray(pcd.points)
+            bbox = points.max(0) - points.min(0)
+            vs = (np.prod(bbox) / max_points) ** (1 / 3)
+            for _ in range(10):
+                down = pcd.voxel_down_sample(vs)
+                ratio = len(down.points) / max_points
+                if 0.9 < ratio < 1.1:
+                    break
+                vs *= ratio ** (1 / 3)
+            pcd = down
+
+        points = np.asarray(pcd.points).astype(np.float32)
+        colors = np.asarray(pcd.colors).astype(np.float32)
+
+        self.N = len(points)
+        # 预计算齐次坐标
+        self.pts_homo = np.hstack([
+            points, np.ones((self.N, 1), dtype=np.float32)
+        ])  # (N, 4)
+        self.colors_u8 = (colors * 255).clip(0, 255).astype(np.uint8)  # (N, 3)
+
+        print(f"[CPUPointCloudRenderer] Loaded {self.N:,} points "
+              f"from {ply_path} in {time.time() - t0:.2f}s")
+
+    def render(self, intrinsic: np.ndarray, extrinsic_w2c: np.ndarray,
+               img_h: int, img_w: int, splat_size: int = 2,
+               return_mask: bool = True):
+        """
+        CPU Splat 渲染
+
+        Args:
+            intrinsic:      (3, 3) 相机内参
+            extrinsic_w2c:  (4, 4) world -> camera
+            img_h, img_w:   输出尺寸
+            splat_size:     splat 半径 (像素)
+            return_mask:    是否返回有效像素 mask
+
+        Returns:
+            color_img: (3, H, W) float32 [0, 1]
+            mask:      (1, H, W) float32 [0, 1] (可选)
+        """
+        # 合并投影矩阵: P = K @ E[:3]
+        proj = (intrinsic @ extrinsic_w2c[:3]).astype(np.float32)  # (3, 4)
+        uvw = proj @ self.pts_homo.T  # (3, N)
+
+        depth = uvw[2]
+        front = depth > 0.1
+
+        u_f = uvw[0, front] / depth[front]
+        v_f = uvw[1, front] / depth[front]
+        d_f = depth[front]
+        c_f = self.colors_u8[front]
+
+        s = splat_size
+        valid = ((u_f >= s) & (u_f < img_w - s) &
+                 (v_f >= s) & (v_f < img_h - s))
+
+        u = u_f[valid].astype(np.int32)
+        v = v_f[valid].astype(np.int32)
+        d = d_f[valid]
+        c = c_f[valid]
+        M = len(u)
+
+        if M == 0:
+            color_out = np.zeros((3, img_h, img_w), dtype=np.float32)
+            mask_out = np.zeros((1, img_h, img_w), dtype=np.float32)
+            if return_mask:
+                return color_out, mask_out
+            return color_out
+
+        # 生成偏移
+        offsets = np.arange(-s, s + 1)
+        dy, dx = np.meshgrid(offsets, offsets, indexing='ij')
+        dy, dx = dy.ravel(), dx.ravel()
+        r2 = dx * dx + dy * dy
+        circle = r2 <= s * s
+        dx, dy = dx[circle], dy[circle]
+        K_off = len(dx)
+
+        # 按深度排序: 远→近 (近覆盖远)
+        order = np.argsort(-d)
+        uu = (u[order, None] + dx[None, :]).ravel()
+        vv = (v[order, None] + dy[None, :]).ravel()
+        cc = np.repeat(c[order], K_off, axis=0)
+
+        # scatter
+        color_img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+        color_img[vv, uu] = cc
+
+        # CHW float32
+        color_out = color_img.transpose(2, 0, 1).astype(np.float32) / 255.0
+
+        if return_mask:
+            mask = np.any(color_img > 0, axis=-1).astype(np.float32)
+            mask_out = mask[np.newaxis]  # (1, H, W)
+            return color_out, mask_out
+
+        return color_out
+
+
+# ============================================================
+#  O3D OffscreenRenderer 版本 (更稠密，稍慢)
+# ============================================================
+
+class O3DPointCloudRenderer:
+    """
+    O3D OffscreenRenderer 渲染
+    适合需要更稠密效果的场景
+    """
+
+    def __init__(self, ply_path: str, max_points: int = None):
+        t0 = time.time()
+        self.pcd = o3d.io.read_point_cloud(ply_path)
+
+        if max_points and len(self.pcd.points) > max_points:
+            points = np.asarray(self.pcd.points)
+            bbox = points.max(0) - points.min(0)
+            vs = (np.prod(bbox) / max_points) ** (1 / 3)
+            for _ in range(10):
+                down = self.pcd.voxel_down_sample(vs)
+                ratio = len(down.points) / max_points
+                if 0.9 < ratio < 1.1:
+                    break
+                vs *= ratio ** (1 / 3)
+            self.pcd = down
+
+        self.N = len(self.pcd.points)
+        # renderer 缓存: (w, h) → renderer
+        self._renderers = {}
+
+        print(f"[O3DPointCloudRenderer] Loaded {self.N:,} points "
+              f"from {ply_path} in {time.time() - t0:.2f}s")
+
+    def _get_renderer(self, img_w, img_h, point_size):
+        key = (img_w, img_h, point_size)
+        if key not in self._renderers:
+            renderer = rendering.OffscreenRenderer(img_w, img_h)
+            renderer.scene.set_background(np.array([0, 0, 0, 1]))
+            mat = rendering.MaterialRecord()
+            mat.shader = "defaultUnlit"
+            mat.point_size = point_size
+            renderer.scene.add_geometry("pcd", self.pcd, mat)
+            self._renderers[key] = renderer
+        return self._renderers[key]
+
+    def render(self, intrinsic: np.ndarray, extrinsic_w2c: np.ndarray,
+               img_h: int, img_w: int, point_size: float = 3.0,
+               return_mask: bool = True):
+        """
+        Returns:
+            color_img: (3, H, W) float32 [0, 1]
+            mask:      (1, H, W) float32 [0, 1]
+        """
+        renderer = self._get_renderer(img_w, img_h, point_size)
+
+        fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+        cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+        pinhole = o3d.camera.PinholeCameraIntrinsic(
+            img_w, img_h, fx, fy, cx, cy
+        )
+        renderer.setup_camera(pinhole, extrinsic_w2c)
+
+        color_o3d = renderer.render_to_image()
+        color_np = np.asarray(color_o3d)  # (H, W, 3) uint8
+
+        color_out = color_np.transpose(2, 0, 1).astype(np.float32) / 255.0
+
+        if return_mask:
+            mask = np.any(color_np > 0, axis=-1).astype(np.float32)
+            mask_out = mask[np.newaxis]
+            return color_out, mask_out
+
+        return color_out
+
+    def cleanup(self):
+        for r in self._renderers.values():
+            r.scene.remove_geometry("pcd")
+        self._renderers.clear()
+
+
+# ============================================================
+#  场景解析工具
+# ============================================================
+
+# 11 个相机名 (按文件名中的关键字)
+CAMERA_NAMES = [
+    "FRONT_LEFT_RESET_OPTICAL_H99",
+    "FRONT_RIGHT_RESET_OPTICAL_H99",
+    "FRONT_TELE_RESET_OPTICAL_H15",
+    "FRONT_TELE_RESET_OPTICAL_H30",
+    "FRONT_WIDE_RESET_OPTICAL_H110",
+    "FRONT_WIDE_RESET_OPTICAL_H60",
+    "REAR_LEFT_RESET_OPTICAL_H30",
+    "REAR_LEFT_RESET_OPTICAL_H99",
+    "REAR_RESET_OPTICAL_H50",
+    "REAR_RIGHT_RESET_OPTICAL_H30",
+    "REAR_RIGHT_RESET_OPTICAL_H99",
+]
+
+# 偏移量列表
+OFFSET_LIST = [
+    "+1.0m", "+2.0m", "+4.0m",
+    "-1.0m", "-2.0m", "-4.0m",
+    "0.0m",
+]
+
+
+def parse_scene_structure(scene_root: str):
+    """
+    解析一个场景的目录结构
+
+    Returns:
+        trajectories: dict
+            {
+                traj_id: {
+                    offset_name: {
+                        timestamp: {
+                            cam_name: image_path,
+                            ...
+                        },
+                        ...
+                    },
+                    ...
+                },
+                ...
+            }
+    """
+    trajectories = {}
+
+    for traj_name in sorted(os.listdir(scene_root)):
+        traj_path = os.path.join(scene_root, traj_name)
+        if not os.path.isdir(traj_path) or traj_name.endswith('.zip'):
+            continue
+        # 跳过非轨迹目录
+        if 'offset' in traj_name:
+            continue
+
+        trajectories[traj_name] = {}
+
+        for offset_dir in sorted(os.listdir(traj_path)):
+            offset_path = os.path.join(traj_path, offset_dir)
+            if not os.path.isdir(offset_path):
+                continue
+            if 'offset' not in offset_dir:
+                continue
+
+            # 提取偏移量
+            offset_match = offset_dir.split('offset_')[-1]  # e.g. "+1.0m"
+
+            trajectories[traj_name][offset_match] = {}
+
+            # 遍历时间戳目录
+            for ts_name in sorted(os.listdir(offset_path)):
+                ts_path = os.path.join(offset_path, ts_name)
+                if not os.path.isdir(ts_path):
+                    continue
+                try:
+                    ts = int(ts_name)
+                except ValueError:
+                    continue
+
+                # 收集该时间戳下的所有相机图像
+                cam_images = {}
+                for fname in os.listdir(ts_path):
+                    if not fname.endswith('.jpg') and not fname.endswith('.png'):
+                        continue
+                    for cam_name in CAMERA_NAMES:
+                        if cam_name in fname:
+                            cam_images[cam_name] = os.path.join(ts_path, fname)
+                            break
+
+                if cam_images:
+                    trajectories[traj_name][offset_match][ts] = cam_images
+
+    return trajectories
+
+
+# ============================================================
+#  主 Dataset
+# ============================================================
+
+class LidarProjectionDataset(Dataset):
+    """
+    点云投影 Dataset
+
+    输入:
+      - 场景列表 CSV (scene_path, ply_path)
+      - 81 个目标相机 c2w 外参 (由外部传入或从文件加载)
+
+    流程:
+      1. 采样场景
+      2. 采样轨迹
+      3. 采样偏移量 (按权重)
+      4. 采样源/目标相机 (按权重)
+      5. 加载 PLY → CPU 投影 → 得到 lidar_rgb + lidar_mask
+      6. 加载原始图像 → source_video + target_video
+      7. 计算相对 pose (每 4 帧采样)
+
+    Returns dict:
+      source_video:     (3, T, H, W)
+      target_video:     (3, T, H, W)
+      render_lidar:     (3, T, H, W)  投影着色
+      render_lidar_mask:(1, T, H, W)  投影 mask
+      camera_embedding: (T//4+1, 12)  每 4 帧采样的 pose
+    """
+
+    def __init__(
+        self,
+        scene_csv_path: str,
+        target_c2w_provider=None,       # 外部传入 c2w 的接口
+        target_cam_json_key: str = "target",   # JSON 中目标相机的 key
+        source_cam_json_key: str = "source",   # JSON 中源相机的 key
+        num_frames: int = 81,
+        height: int = 480,
+        width: int = 832,
+        steps_per_epoch: int = 10000,
+        # 渲染参数
+        renderer_type: str = "cpu",      # "cpu" 或 "o3d"
+        splat_size: int = 2,             # CPU 渲染的 splat 大小
+        point_size: float = 3.0,         # O3D 渲染的点大小
+        max_points: int = 3_000_000,     # 点云最大点数
+        # 采样权重
+        offset_weights: Dict[str, float] = None,   # {"0.0m": 1.0, "+1.0m": 0.5, ...}
+        camera_weights: Dict[str, float] = None,   # {"FRONT_WIDE_...": 1.0, ...}
+        # 相机内参 (渲染投影时使用，需外部提供)
+        render_intrinsic: np.ndarray = None,        # (3,3) 渲染用内参
+        # 每个相机的 splat_size / point_size 可调
+        camera_splat_sizes: Dict[str, int] = None,  # {"FRONT_WIDE_...": 3, ...}
+    ):
+        super().__init__()
+
+        self.num_frames = num_frames
+        self.height = height
+        self.width = width
+        self.steps_per_epoch = steps_per_epoch
+        self.renderer_type = renderer_type
+        self.splat_size = splat_size
+        self.point_size = point_size
+        self.max_points = max_points
+        self.camera_splat_sizes = camera_splat_sizes or {}
+        self.target_c2w_provider = target_c2w_provider
+        self.target_cam_json_key = target_cam_json_key
+        self.source_cam_json_key = source_cam_json_key
+
+        # 读取场景列表
+        self.scene_df = pd.read_csv(scene_csv_path)
+        # 期望列: scene_path, ply_path, (可选: cameras_json_path)
+        assert 'scene_path' in self.scene_df.columns
+        assert 'ply_path' in self.scene_df.columns
+
+        # 解析每个场景的目录结构
+        print("Parsing scene structures...")
+        self.scene_structures = {}
+        self.valid_scenes = []
+        for idx, row in self.scene_df.iterrows():
+            scene_path = row['scene_path']
+            ply_path = row['ply_path']
+            if not os.path.exists(scene_path):
+                print(f"  [SKIP] Scene not found: {scene_path}")
+                continue
+            if not os.path.exists(ply_path):
+                print(f"  [SKIP] PLY not found: {ply_path}")
+                continue
+
+            structure = parse_scene_structure(scene_path)
+            if structure:
+                self.scene_structures[idx] = {
+                    'scene_path': scene_path,
+                    'ply_path': ply_path,
+                    'structure': structure,
+                    'cameras_json': row.get('cameras_json_path', None),
+                }
+                self.valid_scenes.append(idx)
+
+        print(f"Valid scenes: {len(self.valid_scenes)}")
+        assert len(self.valid_scenes) > 0, "No valid scenes found!"
+
+        # 渲染器缓存: ply_path → renderer
+        self._renderer_cache = {}
+
+        # 采样权重
+        self.offset_weights = offset_weights or {o: 1.0 for o in OFFSET_LIST}
+        self.camera_weights = camera_weights or {c: 1.0 for c in CAMERA_NAMES}
+
+        # 归一化权重
+        self._offset_names, self._offset_probs = self._normalize_weights(self.offset_weights)
+        self._camera_names, self._camera_probs = self._normalize_weights(self.camera_weights)
+
+        # 渲染用内参 (如果不提供，使用默认)
+        if render_intrinsic is not None:
+            self.render_intrinsic = render_intrinsic.astype(np.float32)
+        else:
+            # 默认内参 (需要替换为你的实际内参)
+            self.render_intrinsic = np.array([
+                [width * 0.8, 0, width / 2],
+                [0, width * 0.8, height / 2],
+                [0, 0, 1]
+            ], dtype=np.float32)
+
+        # 图像处理
+        self.frame_process = v2.Compose([
+            v2.CenterCrop(size=(height, width)),
+            v2.Resize(size=(height, width), antialias=True),
+            v2.ToTensor(),
+            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
+
+    @staticmethod
+    def _normalize_weights(weight_dict):
+        names = list(weight_dict.keys())
+        weights = np.array([weight_dict[n] for n in names], dtype=np.float64)
+        probs = weights / weights.sum()
+        return names, probs
+
+    def _get_renderer(self, ply_path: str):
+        """获取或创建渲染器 (缓存)"""
+        if ply_path not in self._renderer_cache:
+            if self.renderer_type == "o3d":
+                self._renderer_cache[ply_path] = O3DPointCloudRenderer(
+                    ply_path, max_points=self.max_points
+                )
+            else:
+                self._renderer_cache[ply_path] = CPUPointCloudRenderer(
+                    ply_path, max_points=self.max_points
+                )
+        return self._renderer_cache[ply_path]
+
+    def crop_and_resize(self, image):
+        """与原始代码保持一致的 crop_and_resize"""
+        width, height = image.size
+        scale = max(self.width / width, self.height / height)
+        image = torchvision.transforms.functional.resize(
+            image,
+            (round(height * scale), round(width * scale)),
+            interpolation=torchvision.transforms.InterpolationMode.BILINEAR
+        )
+        return image
+
+    def load_image_as_tensor(self, path: str):
+        """加载单张图片并处理为 tensor"""
+        img = Image.open(path).convert("RGB")
+        img = self.crop_and_resize(img)
+        img = self.frame_process(img)
+        return img  # (3, H, W)
+
+    @staticmethod
+    def get_relative_pose(cam_params):
+        """计算相对 pose (与原始代码一致)"""
+        abs_w2cs = [cam_param.w2c_mat for cam_param in cam_params]
+        abs_c2ws = [cam_param.c2w_mat for cam_param in cam_params]
+        target_cam_c2w = np.eye(4, dtype=np.float32)
+        abs2rel = target_cam_c2w @ abs_w2cs[0]
+        ret_poses = [target_cam_c2w] + [abs2rel @ abs_c2w for abs_c2w in abs_c2ws[1:]]
+        ret_poses = np.array(ret_poses, dtype=np.float32)
+        return ret_poses
+
+    def _sample_offset(self, available_offsets: list):
+        """按权重采样偏移量"""
+        # 过滤出实际存在的偏移
+        valid = [(n, p) for n, p in zip(self._offset_names, self._offset_probs)
+                 if n in available_offsets]
+        if not valid:
+            return random.choice(available_offsets)
+        names, probs = zip(*valid)
+        probs = np.array(probs)
+        probs = probs / probs.sum()
+        return np.random.choice(names, p=probs)
+
+    def _sample_camera(self, available_cameras: list):
+        """按权重采样相机"""
+        valid = [(n, p) for n, p in zip(self._camera_names, self._camera_probs)
+                 if n in available_cameras]
+        if not valid:
+            return random.choice(available_cameras)
+        names, probs = zip(*valid)
+        probs = np.array(probs)
+        probs = probs / probs.sum()
+        return np.random.choice(names, p=probs)
+
+    def _render_single_frame(self, renderer, c2w: np.ndarray, cam_name: str = None):
+        """
+        渲染单帧
+
+        Args:
+            renderer: CPUPointCloudRenderer 或 O3DPointCloudRenderer
+            c2w: (4, 4) camera-to-world
+            cam_name: 相机名 (用于获取该相机特定的 splat_size)
+
+        Returns:
+            color: (3, H, W) float32 [0, 1]
+            mask:  (1, H, W) float32 [0, 1]
+        """
+        w2c = np.linalg.inv(c2w).astype(np.float32)
+
+        if isinstance(renderer, O3DPointCloudRenderer):
+            ps = self.camera_splat_sizes.get(cam_name, self.point_size) if cam_name else self.point_size
+            return renderer.render(
+                self.render_intrinsic, w2c,
+                self.height, self.width,
+                point_size=ps, return_mask=True
+            )
+        else:
+            ss = self.camera_splat_sizes.get(cam_name, self.splat_size) if cam_name else self.splat_size
+            return renderer.render(
+                self.render_intrinsic, w2c,
+                self.height, self.width,
+                splat_size=ss, return_mask=True
+            )
+
+    def __len__(self):
+        return self.steps_per_epoch
+
+    def __getitem__(self, index):
+        while True:
+            try:
+                return self._load_sample(index)
+            except Exception as e:
+                print(f"[LidarProjectionDataset] Error at index {index}: {e}")
+                index = random.randrange(len(self.valid_scenes))
+
+    def _load_sample(self, index):
+        t_start = time.time()
+
+        # ---- 1. 采样场景 ----
+        scene_idx = self.valid_scenes[index % len(self.valid_scenes)]
+        scene_info = self.scene_structures[scene_idx]
+        scene_path = scene_info['scene_path']
+        ply_path = scene_info['ply_path']
+        structure = scene_info['structure']
+
+        # ---- 2. 采样轨迹 ----
+        traj_ids = list(structure.keys())
+        traj_id = random.choice(traj_ids)
+        traj_data = structure[traj_id]
+
+        # ---- 3. 采样偏移量 (按权重) ----
+        available_offsets = list(traj_data.keys())
+        offset = self._sample_offset(available_offsets)
+        offset_data = traj_data[offset]
+
+        # ---- 4. 获取时间戳序列 ----
+        timestamps = sorted(offset_data.keys())
+        if len(timestamps) < self.num_frames:
+            raise ValueError(f"Not enough frames: {len(timestamps)} < {self.num_frames}")
+
+        # 取最后 num_frames 帧 (与原始代码一致)
+        timestamps = timestamps[-self.num_frames:]
+
+        # ---- 5. 采样源相机 (按权重) ----
+        # 用第一帧的可用相机列表
+        first_ts_cams = list(offset_data[timestamps[0]].keys())
+        source_cam = self._sample_camera(first_ts_cams)
+
+        # ---- 6. 加载源视角 RGB ----
+        source_frames = []
+        for ts in timestamps:
+            ts_cams = offset_data[ts]
+            if source_cam not in ts_cams:
+                raise ValueError(f"Camera {source_cam} missing at timestamp {ts}")
+            img = self.load_image_as_tensor(ts_cams[source_cam])
+            source_frames.append(img)
+        source_video = torch.stack(source_frames, dim=1)  # (3, T, H, W)
+
+        # ---- 7. 获取目标相机 c2w (81帧) ----
+        # 接口: target_c2w_provider(scene_path, traj_id, offset, timestamps)
+        #        返回 (81, 4, 4) numpy array
+        if self.target_c2w_provider is not None:
+            target_c2ws = self.target_c2w_provider(
+                scene_path, traj_id, offset, timestamps
+            )
+        else:
+            # 从 cameras_extrinsics.json 加载 (fallback)
+            cam_json_path = scene_info.get('cameras_json')
+            if cam_json_path and os.path.exists(cam_json_path):
+                with open(cam_json_path, 'r') as f:
+                    cam_data = json.load(f)
+                target_c2ws = np.array(cam_data[self.target_cam_json_key],
+                                       dtype=np.float32)
+            else:
+                raise ValueError(
+                    "No target_c2w_provider and no cameras_json_path. "
+                    "Please provide target camera extrinsics."
+                )
+
+        assert target_c2ws.shape == (self.num_frames, 4, 4), \
+            f"Expected target_c2ws shape ({self.num_frames}, 4, 4), " \
+            f"got {target_c2ws.shape}"
+
+        # ---- 8. 获取源相机 c2w (用于计算 relative pose) ----
+        if self.target_c2w_provider is not None:
+            # 如果有 provider，也提供源相机
+            source_c2ws = self.target_c2w_provider(
+                scene_path, traj_id, offset, timestamps,
+                camera_type="source"
+            )
+        else:
+            if cam_json_path and os.path.exists(cam_json_path):
+                with open(cam_json_path, 'r') as f:
+                    cam_data = json.load(f)
+                source_c2ws = np.array(cam_data[self.source_cam_json_key],
+                                        dtype=np.float32)
+            else:
+                # 用 target_c2ws 作为 source 的 fallback
+                source_c2ws = target_c2ws.copy()
+
+        # ---- 9. 加载目标视角 RGB (如有) ----
+        # 目标视角可能和源视角不同，这里先预留
+        # 如果目标视角也有原始图像，可以加载
+        target_video = source_video.clone()  # placeholder, 根据需求替换
+
+        # ---- 10. PLY 投影: 渲染 lidar_rgb + lidar_mask ----
+        renderer = self._get_renderer(ply_path)
+
+        lidar_colors = []
+        lidar_masks = []
+
+        for fi in range(self.num_frames):
+            c2w = target_c2ws[fi]
+            color, mask = self._render_single_frame(renderer, c2w, cam_name=source_cam)
+            lidar_colors.append(torch.from_numpy(color))
+            lidar_masks.append(torch.from_numpy(mask))
+
+        render_lidar = torch.stack(lidar_colors, dim=1)     # (3, T, H, W)
+        render_lidar_mask = torch.stack(lidar_masks, dim=1)  # (1, T, H, W)
+
+        # ---- 11. 计算 relative pose (每4帧采样) ----
+        cam_idx = list(range(self.num_frames))[::4]
+
+        source_cam_params = [Camera(source_c2ws[i]) for i in range(self.num_frames)]
+        target_cam_params = [Camera(target_c2ws[i]) for i in range(self.num_frames)]
+
+        relative_poses = []
+        for i in cam_idx:
+            relative_pose = self.get_relative_pose(
+                [source_cam_params[i], target_cam_params[i]]
+            )
+            relative_poses.append(
+                torch.as_tensor(relative_pose)[:, :3, :][1]
+            )
+        pose_embedding = torch.stack(relative_poses, dim=0)  # (21, 3, 4)
+        camera_embedding = rearrange(
+            pose_embedding, 'b c d -> b (c d)'
+        ).to(torch.bfloat16)
+
+        t_total = time.time() - t_start
+
+        return {
+            "source_video": source_video,               # (3, T, H, W) float32
+            "target_video": target_video,               # (3, T, H, W) float32
+            "render_lidar": render_lidar,               # (3, T, H, W) float32
+            "render_lidar_mask": render_lidar_mask,     # (1, T, H, W) float32
+            "camera_embedding": camera_embedding,       # (21, 12) bfloat16
+            "scene_path": scene_path,
+            "traj_id": traj_id,
+            "offset": offset,
+            "source_cam": source_cam,
+            "load_time": t_total,
+        }
+
+
+# ============================================================
+#  DataLoader 创建
+# ============================================================
+
+def create_lidar_projection_loader(
+    scene_csv_path: str,
+    target_c2w_provider=None,
+    batch_size: int = 1,
+    num_workers: int = 4,
+    **dataset_kwargs
+):
+    """
+    创建 DataLoader
+
+    num_workers > 0: CPU 多进程渲染 (推荐)
+    注意: 使用 CPU 渲染时可以多 worker
+          使用 O3D 渲染时 num_workers 建议 0 或 1
+    """
+    dataset = LidarProjectionDataset(
+        scene_csv_path=scene_csv_path,
+        target_c2w_provider=target_c2w_provider,
+        **dataset_kwargs
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
+        drop_last=True,
+    )
+
+    return loader
+
+
+# ============================================================
+#  测试脚本
+# ============================================================
+
+def test_dataset():
+    """
+    测试脚本: 验证数据集能正常工作，记录时间和输出
+    """
+    import argparse
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    parser = argparse.ArgumentParser(description="Test LidarProjectionDataset")
+    parser.add_argument("--scene_csv", type=str, required=True,
+                        help="Path to scene CSV (columns: scene_path, ply_path)")
+    parser.add_argument("--output_dir", type=str, default="test_output",
+                        help="Output directory for visualizations")
+    parser.add_argument("--num_samples", type=int, default=3,
+                        help="Number of samples to test")
+    parser.add_argument("--renderer", type=str, default="cpu",
+                        choices=["cpu", "o3d"])
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=832)
+    parser.add_argument("--splat_size", type=int, default=2)
+    parser.add_argument("--point_size", type=float, default=3.0)
+    parser.add_argument("--num_frames", type=int, default=81)
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    print("=" * 60)
+    print("Testing LidarProjectionDataset")
+    print("=" * 60)
+
+    # --- 简单的 c2w provider (测试用) ---
+    def dummy_c2w_provider(scene_path, traj_id, offset, timestamps,
+                           camera_type="target"):
+        """
+        测试用: 生成围绕原点旋转的相机轨迹
+        实际使用时替换为真实外参加载
+        """
+        n = len(timestamps)
+        c2ws = []
+        for i in range(n):
+            theta = np.radians(i * 2)  # 每帧旋转2度
+            c2w = np.eye(4, dtype=np.float32)
+            c2w[0, 0] = np.cos(theta)
+            c2w[0, 2] = np.sin(theta)
+            c2w[2, 0] = -np.sin(theta)
+            c2w[2, 2] = np.cos(theta)
+            c2w[2, 3] = 10  # 距原点 10m
+            c2ws.append(c2w)
+        return np.array(c2ws, dtype=np.float32)
+
+    # --- 创建 Dataset ---
+    print("\nCreating dataset...")
+    t0 = time.time()
+
+    dataset = LidarProjectionDataset(
+        scene_csv_path=args.scene_csv,
+        target_c2w_provider=dummy_c2w_provider,
+        num_frames=args.num_frames,
+        height=args.height,
+        width=args.width,
+        steps_per_epoch=args.num_samples * 10,
+        renderer_type=args.renderer,
+        splat_size=args.splat_size,
+        point_size=args.point_size,
+        max_points=3_000_000,
+    )
+    print(f"Dataset created in {time.time() - t0:.2f}s")
+    print(f"  Scenes: {len(dataset.valid_scenes)}")
+    print(f"  Renderer: {args.renderer}")
+    print(f"  Splat/Point size: {args.splat_size}/{args.point_size}")
+
+    # --- 逐样本测试 ---
+    load_times = []
+    render_times_per_frame = []
+
+    for sample_idx in range(args.num_samples):
+        print(f"\n--- Sample {sample_idx + 1}/{args.num_samples} ---")
+
+        t0 = time.time()
+        try:
+            data = dataset[sample_idx]
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            continue
+        total_time = time.time() - t0
+        load_times.append(total_time)
+
+        inner_time = data['load_time']
+        per_frame = inner_time / args.num_frames
+        render_times_per_frame.append(per_frame)
+
+        print(f"  Scene:   {data['scene_path']}")
+        print(f"  Traj:    {data['traj_id']}")
+        print(f"  Offset:  {data['offset']}")
+        print(f"  Camera:  {data['source_cam']}")
+        print(f"  Time:    {total_time:.2f}s total, {per_frame * 1000:.1f}ms/frame")
+
+        # 打印 tensor shapes
+        for key in ['source_video', 'target_video', 'render_lidar',
+                     'render_lidar_mask', 'camera_embedding']:
+            if key in data and isinstance(data[key], torch.Tensor):
+                print(f"  {key:25s}: {list(data[key].shape)}, "
+                      f"dtype={data[key].dtype}")
+
+        # --- 可视化 ---
+        sample_dir = os.path.join(args.output_dir, f"sample_{sample_idx:03d}")
+        os.makedirs(sample_dir, exist_ok=True)
+
+        # 保存几帧可视化
+        vis_frame_indices = [0, args.num_frames // 4,
+                             args.num_frames // 2,
+                             3 * args.num_frames // 4,
+                             args.num_frames - 1]
+
+        for fi in vis_frame_indices:
+            fig, axes = plt.subplots(1, 4, figsize=(24, 6))
+
+            # source
+            src = data['source_video'][:, fi]  # (3, H, W)
+            src = (src * 0.5 + 0.5).clamp(0, 1).permute(1, 2, 0).numpy()
+            axes[0].imshow(src)
+            axes[0].set_title(f"Source (frame {fi})")
+
+            # target
+            tgt = data['target_video'][:, fi]
+            tgt = (tgt * 0.5 + 0.5).clamp(0, 1).permute(1, 2, 0).numpy()
+            axes[1].imshow(tgt)
+            axes[1].set_title(f"Target (frame {fi})")
+
+            # lidar render
+            lidar = data['render_lidar'][:, fi]
+            lidar_np = lidar.permute(1, 2, 0).numpy()
+            axes[2].imshow(lidar_np)
+            axes[2].set_title(f"LiDAR render (frame {fi})")
+
+            # lidar mask
+            mask = data['render_lidar_mask'][0, fi]
+            axes[3].imshow(mask.numpy(), cmap='gray')
+            axes[3].set_title(f"LiDAR mask (frame {fi})")
+
+            for ax in axes:
+                ax.axis('off')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(sample_dir, f"frame_{fi:03d}.png"),
+                        dpi=100, bbox_inches='tight')
+            plt.close()
+
+        # 保存 lidar 渲染视频 (所有帧)
+        lidar_frames = []
+        for fi in range(args.num_frames):
+            lidar_f = data['render_lidar'][:, fi].permute(1, 2, 0).numpy()
+            lidar_f = (lidar_f * 255).clip(0, 255).astype(np.uint8)
+            lidar_frames.append(lidar_f)
+
+        # 保存为 mp4
+        try:
+            import imageio
+            video_path = os.path.join(sample_dir, "render_lidar.mp4")
+            writer = imageio.get_writer(video_path, fps=10)
+            for frame in lidar_frames:
+                writer.append_data(frame)
+            writer.close()
+            print(f"  Saved video: {video_path}")
+        except Exception as e:
+            print(f"  Video save failed: {e}")
+
+    # --- 统计 ---
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    if load_times:
+        print(f"  Samples tested:       {len(load_times)}")
+        print(f"  Avg total time:       {np.mean(load_times):.2f}s")
+        print(f"  Avg per-frame render: {np.mean(render_times_per_frame) * 1000:.1f}ms")
+        print(f"  Est. FPS:             {1.0 / np.mean(render_times_per_frame):.1f}")
+        print(f"  Est. time for 81 frames: "
+              f"{np.mean(render_times_per_frame) * 81:.2f}s")
+    else:
+        print("  No samples loaded successfully!")
+
+    print(f"\nOutput saved to: {args.output_dir}")
+    print("Done!")
+
+
+# ============================================================
+#  快速功能测试 (不需要真实数据)
+# ============================================================
+
+def test_renderer_standalone():
+    """
+    独立测试渲染器 (用随机点云)
+    不需要真实数据文件
+    """
+    import tempfile
+
+    print("Testing renderer with random point cloud...")
+
+    # 生成随机点云
+    N = 100000
+    points = np.random.randn(N, 3).astype(np.float32) * 10
+    colors = np.random.rand(N, 3).astype(np.float32)
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    # 保存临时 ply
+    with tempfile.NamedTemporaryFile(suffix='.ply', delete=False) as f:
+        tmp_ply = f.name
+    o3d.io.write_point_cloud(tmp_ply, pcd, write_ascii=False)
+
+    # 内参
+    K = np.array([
+        [500, 0, 416],
+        [0, 500, 240],
+        [0, 0, 1]
+    ], dtype=np.float32)
+
+    # 外参
+    c2w = np.eye(4, dtype=np.float32)
+    c2w[2, 3] = 20  # 相机在 z=20
+    w2c = np.linalg.inv(c2w)
+
+    # CPU 渲染
+    print("\n--- CPU Renderer ---")
+    cpu_renderer = CPUPointCloudRenderer(tmp_ply)
+    t0 = time.time()
+    for _ in range(10):
+        color, mask = cpu_renderer.render(K, w2c, 480, 832, splat_size=2)
+    avg_cpu = (time.time() - t0) / 10
+    print(f"  Color: {color.shape}, Mask: {mask.shape}")
+    print(f"  Avg time: {avg_cpu * 1000:.1f}ms")
+    print(f"  Coverage: {mask.mean():.1%}")
+
+    # O3D 渲染
+    print("\n--- O3D Renderer ---")
+    o3d_renderer = O3DPointCloudRenderer(tmp_ply)
+    # warmup
+    o3d_renderer.render(K, w2c, 480, 832, point_size=3.0)
+    t0 = time.time()
+    for _ in range(10):
+        color, mask = o3d_renderer.render(K, w2c, 480, 832, point_size=3.0)
+    avg_o3d = (time.time() - t0) / 10
+    print(f"  Color: {color.shape}, Mask: {mask.shape}")
+    print(f"  Avg time: {avg_o3d * 1000:.1f}ms")
+    print(f"  Coverage: {mask.mean():.1%}")
+    o3d_renderer.cleanup()
+
+    # 可视化
+    print("\nSaving test renders...")
+    for name, arr in [("cpu_render", color)]:
+        img = (arr.transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+        cv2.imwrite(f"test_{name}.png", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+
+    # 清理
+    os.remove(tmp_ply)
+    print("Done!")
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--test-renderer":
+        test_renderer_standalone()
+    else:
+        test_dataset()

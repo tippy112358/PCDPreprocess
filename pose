@@ -1,0 +1,351 @@
+ """
+Camera pose provider for the dataset module.
+
+Provides c2w (camera-to-world) matrices for rendering and training.
+Integrates with existing projection utilities for intrinsic/extrinsic loading.
+"""
+import os
+import sys
+from typing import Dict, List, Optional, Tuple
+from collections import defaultdict
+import numpy as np
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from utils.transform_utils import compute_world_to_cam_matrix
+from utils.calibration_utils import load_camera_params, get_camera_intrinsics
+from utils.io_utils import parse_vehicle_pose
+
+
+# Camera name mapping
+CAMERA_NAMES = [
+    "FRONT_LEFT_RESET_OPTICAL_H99",
+    "FRONT_RIGHT_RESET_OPTICAL_H99",
+    "FRONT_TELE_RESET_OPTICAL_H15",
+    "FRONT_TELE_RESET_OPTICAL_H30",
+    "FRONT_WIDE_RESET_OPTICAL_H110",
+    "FRONT_WIDE_RESET_OPTICAL_H60",
+    "REAR_LEFT_RESET_OPTICAL_H30",
+    "REAR_LEFT_RESET_OPTICAL_H99",
+    "REAR_RESET_OPTICAL_H50",
+    "REAR_RIGHT_RESET_OPTICAL_H30",
+    "REAR_RIGHT_RESET_OPTICAL_H99",
+]
+
+# Full camera names with prefix
+FULL_CAMERA_NAMES = [f"CAM_PBQ_{name}" for name in CAMERA_NAMES]
+
+
+class CameraPoseProvider:
+    """
+    Provides camera poses (c2w matrices) for dataset rendering.
+
+    Loads camera parameters and vehicle poses from disk to compute
+    camera-to-world transformations.
+    """
+
+    def __init__(self, cache_params: bool = True):
+        """
+        Args:
+            cache_params: Whether to cache camera params to avoid reloading
+        """
+        self.cache_params = cache_params
+        self._camera_params_cache: Dict[str, Dict] = {}
+        self._vehicle_pose_cache: Dict[str, Dict] = {}
+
+    def _get_camera_params_path(self, scene_path: str, offset: str) -> str:
+        """Get path to camera_params.json for a given scene and offset."""
+        # scene_path format: test/lijiaoqiao_20260205_02
+        # offset format: 0.0m, -1.0m, etc.
+        # Need to construct: test/lijiaoqiao_20260205_02/lijiaoqiao_20260205_02_offset_0.0m/camera_params.json
+        sequence_name = os.path.basename(scene_path)
+        offset_dir = f"{sequence_name}_offset_{offset}"
+        camera_params_path = os.path.join(scene_path, offset_dir, "camera_params.json")
+        return camera_params_path
+
+    def _get_vehicle_pose_path(self, scene_path: str, offset: str, timestamp: int) -> str:
+        """Get path to data_frame.pb.txt for a given scene, offset, and timestamp."""
+        sequence_name = os.path.basename(scene_path)
+        offset_dir = f"{sequence_name}_offset_{offset}"
+        pb_path = os.path.join(scene_path, offset_dir, str(timestamp), "data_frame.pb.txt")
+        return pb_path
+
+    def load_camera_params(self, scene_path: str, offset: str) -> Dict:
+        """Load camera parameters from disk (with optional caching)."""
+        cache_key = f"{scene_path}_{offset}"
+        if self.cache_params and cache_key in self._camera_params_cache:
+            return self._camera_params_cache[cache_key]
+
+        camera_params_path = self._get_camera_params_path(scene_path, offset)
+        if not os.path.exists(camera_params_path):
+            raise FileNotFoundError(f"Camera params not found: {camera_params_path}")
+
+        params = load_camera_params(camera_params_path)
+
+        if self.cache_params:
+            self._camera_params_cache[cache_key] = params
+
+        return params
+
+    def load_vehicle_pose(self, scene_path: str, offset: str, timestamp: int) -> Dict:
+        """Load vehicle pose from disk (with optional caching)."""
+        cache_key = f"{scene_path}_{offset}_{timestamp}"
+        if self.cache_params and cache_key in self._vehicle_pose_cache:
+            return self._vehicle_pose_cache[cache_key]
+
+        pb_path = self._get_vehicle_pose_path(scene_path, offset, timestamp)
+        if not os.path.exists(pb_path):
+            raise FileNotFoundError(f"Vehicle pose file not found: {pb_path}")
+
+        pose = parse_vehicle_pose(pb_path)
+
+        if self.cache_params:
+            self._vehicle_pose_cache[cache_key] = pose
+
+        return pose
+
+    def compute_c2w_matrix(self, vehicle_pose: Dict, camera_params: Dict) -> np.ndarray:
+        """
+        Compute camera-to-world transformation matrix.
+
+        Args:
+            vehicle_pose: Vehicle pose dict with x, y, z, yaw (radians)
+            camera_params: Camera parameters dict
+
+        Returns:
+            4x4 camera-to-world transformation matrix
+        """
+        # Get world-to-camera matrix
+        w2c = compute_world_to_cam_matrix(vehicle_pose, camera_params)
+
+        # Invert to get camera-to-world
+        c2w = np.linalg.inv(w2c)
+
+        return c2w
+
+    def get_intrinsics_matrix(self, scene_path: str, offset: str, camera_name: str) -> np.ndarray:
+        """
+        Get 3x3 intrinsic matrix for a specific camera.
+
+        Args:
+            scene_path: Path to scene directory
+            offset: Offset string (e.g., "0.0m")
+            camera_name: Full camera name (e.g., "CAM_PBQ_FRONT_WIDE_RESET_OPTICAL_H110")
+
+        Returns:
+            3x3 intrinsic matrix
+        """
+        camera_params = self.load_camera_params(scene_path, offset)
+
+        if camera_name not in camera_params:
+            # Try with short name
+            if camera_name in CAMERA_NAMES:
+                camera_name = f"CAM_PBQ_{camera_name}"
+            else:
+                raise ValueError(f"Camera {camera_name} not found in params")
+
+        intrinsics = get_camera_intrinsics(camera_params, camera_name)
+
+        # Build 3x3 matrix
+        K = np.array([
+            [intrinsics['fx'], 0, intrinsics['cx']],
+            [0, intrinsics['fy'], intrinsics['cy']],
+            [0, 0, 1]
+        ], dtype=np.float32)
+
+        return K
+
+    def get_camera_c2ws(
+        self,
+        scene_path: str,
+        traj_id: str,
+        offset: str,
+        timestamps: List[int],
+        camera_name: str
+    ) -> np.ndarray:
+        """
+        Get camera-to-world matrices for a specific camera across timestamps.
+
+        Args:
+            scene_path: Path to scene directory
+            traj_id: Trajectory ID (unused in this implementation, for compatibility)
+            offset: Offset string (e.g., "0.0m")
+            timestamps: List of timestamp integers
+            camera_name: Full camera name (e.g., "CAM_PBQ_FRONT_WIDE_RESET_OPTICAL_H110")
+
+        Returns:
+            (N, 4, 4) numpy array of camera-to-world matrices
+        """
+        # Load camera params once
+        camera_params = self.load_camera_params(scene_path, offset)
+
+        # Ensure full camera name
+        if camera_name not in camera_params:
+            if camera_name in CAMERA_NAMES:
+                full_camera_name = f"CAM_PBQ_{camera_name}"
+            else:
+                raise ValueError(f"Camera {camera_name} not found in params")
+        else:
+            full_camera_name = camera_name
+
+        cam_params = camera_params[full_camera_name]
+
+        # Compute c2w for each timestamp
+        c2ws = []
+        for ts in timestamps:
+            vehicle_pose = self.load_vehicle_pose(scene_path, offset, ts)
+            c2w = self.compute_c2w_matrix(vehicle_pose, cam_params)
+            c2ws.append(c2w)
+
+        return np.array(c2ws, dtype=np.float32)
+
+
+# Global provider instance for convenience
+_global_provider = None
+
+
+def get_global_provider() -> CameraPoseProvider:
+    """Get or create global camera pose provider instance."""
+    global _global_provider
+    if _global_provider is None:
+        _global_provider = CameraPoseProvider(cache_params=True)
+    return _global_provider
+
+
+def create_camera_c2w_provider(camera_name: str = None, provider: CameraPoseProvider = None):
+    """
+    Create a c2w provider function compatible with the dataset interface.
+
+    The returned function has signature:
+        target_c2w_provider(scene_path, traj_id, offset, timestamps, camera_type="target")
+        -> (N, 4, 4) numpy array
+
+    Args:
+        camera_name: Full camera name (e.g., "CAM_PBQ_FRONT_WIDE_RESET_OPTICAL_H110")
+                    If None, uses a default camera
+        provider: CameraPoseProvider instance. If None, uses global instance
+
+    Returns:
+        Function that provides c2w matrices
+    """
+    if provider is None:
+        provider = get_global_provider()
+
+    if camera_name is None:
+        # Default to front wide camera
+        camera_name = "CAM_PBQ_FRONT_WIDE_RESET_OPTICAL_H110"
+
+    def c2w_provider(scene_path: str, traj_id: str, offset: str,
+                     timestamps: List[int], camera_type: str = "target") -> np.ndarray:
+        """
+        Provide c2w matrices for the dataset.
+
+        Args:
+            scene_path: Path to scene directory
+            traj_id: Trajectory ID (for logging, not used in computation)
+            offset: Offset string (e.g., "0.0m")
+            timestamps: List of timestamp integers
+            camera_type: "target" or "source" (currently uses same camera for both)
+
+        Returns:
+            (N, 4, 4) numpy array of camera-to-world matrices
+        """
+        # For now, use same camera for both target and source
+        # Can be extended to support different cameras
+        return provider.get_camera_c2ws(scene_path, traj_id, offset, timestamps, camera_name)
+
+    return c2w_provider
+
+
+def create_multi_camera_c2w_provider(
+    camera_mapping: Dict[str, str] = None,
+    provider: CameraPoseProvider = None
+):
+    """
+    Create a c2w provider that supports different cameras for target/source.
+
+    Args:
+        camera_mapping: Dict mapping camera_type to camera_name
+                      e.g., {"target": "CAM_PBQ_FRONT_WIDE_H110", "source": "CAM_PBQ_FRONT_LEFT_H99"}
+        provider: CameraPoseProvider instance
+
+    Returns:
+        Function that provides c2w matrices for different camera types
+    """
+    if provider is None:
+        provider = get_global_provider()
+
+    if camera_mapping is None:
+        camera_mapping = {
+            "target": "CAM_PBQ_FRONT_WIDE_RESET_OPTICAL_H110",
+            "source": "CAM_PBQ_FRONT_WIDE_RESET_OPTICAL_H110"
+        }
+
+    def c2w_provider(scene_path: str, traj_id: str, offset: str,
+                     timestamps: List[int], camera_type: str = "target") -> np.ndarray:
+        camera_name = camera_mapping.get(camera_type, camera_mapping["target"])
+        return provider.get_camera_c2ws(scene_path, traj_id, offset, timestamps, camera_name)
+
+    return c2w_provider
+
+
+def create_per_sample_camera_provider(
+    default_camera: str = "CAM_PBQ_FRONT_WIDE_RESET_OPTICAL_H110",
+    provider: CameraPoseProvider = None
+):
+    """
+    Create a c2w provider that determines camera from sample data.
+
+    This provider extracts the camera name from the sample's source_cam field.
+
+    Args:
+        default_camera: Default camera if not specified in sample
+        provider: CameraPoseProvider instance
+
+    Returns:
+        Function that can be called with camera_name from sample
+    """
+    if provider is None:
+        provider = get_global_provider()
+
+    class PerSampleProvider:
+        def __call__(self, scene_path: str, traj_id: str, offset: str,
+                     timestamps: List[int], camera_type: str = "target",
+                     camera_name: str = None) -> np.ndarray:
+            if camera_name is None:
+                camera_name = default_camera
+            return provider.get_camera_c2ws(scene_path, traj_id, offset, timestamps, camera_name)
+
+    return PerSampleProvider()
+
+
+def get_all_camera_intrinsics(scene_path: str, offset: str,
+                               provider: CameraPoseProvider = None) -> Dict[str, np.ndarray]:
+    """
+    Get intrinsic matrices for all cameras in a scene/offset.
+
+    Args:
+        scene_path: Path to scene directory
+        offset: Offset string
+        provider: CameraPoseProvider instance
+
+    Returns:
+        Dict mapping camera name to 3x3 intrinsic matrix
+    """
+    if provider is None:
+        provider = get_global_provider()
+
+    camera_params = provider.load_camera_params(scene_path, offset)
+    intrinsics = {}
+
+    for cam_name, cam_data in camera_params.items():
+        intr = cam_data['intrinsics']
+        K = np.array([
+            [intr['fx'], 0, intr['cx']],
+            [0, intr['fy'], intr['cy']],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        intrinsics[cam_name] = K
+
+    return intrinsics

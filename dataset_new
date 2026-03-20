@@ -1,5 +1,6 @@
 import torch
 import os
+import sys
 import pandas as pd
 import numpy as np
 import cv2
@@ -14,27 +15,110 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import v2
 import torchvision
 from einops import rearrange
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Callable
 from collections import defaultdict
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.utils.camera_pose_provider import (
+    CameraPoseProvider,
+    create_camera_c2w_provider,
+    create_per_sample_camera_provider,
+    get_all_camera_intrinsics
+)
 
 
 # ============================================================
-#  Camera 工具 (保留原始接口)
+#  Camera 工具
 # ============================================================
 
 class Camera(object):
-    def __init__(self, c2w):
-        c2w = np.linalg.inv(np.array(c2w).reshape(4, 4))
-        c2w[:3, 3] *= 1.5
-        swap_axes = np.array([
-            [0, 0, -1, 0],
-            [0, 1, 0, 0],
-            [-1, 0, 0, 0],
-            [0, 0, 0, 1]
-        ])
-        c2w = swap_axes @ c2w @ np.linalg.inv(swap_axes)
+    """
+    Camera pose wrapper for computing relative poses.
+
+    Note: This class applies coordinate transformations that may be
+    specific to certain datasets. Use RawCamera for direct c2w matrices.
+    """
+    def __init__(self, c2w, apply_transform: bool = True):
+        """
+        Args:
+            c2w: 4x4 camera-to-world matrix
+            apply_transform: Whether to apply coordinate transformations
+        """
+        c2w = np.array(c2w).reshape(4, 4)
+        if apply_transform:
+            # Original transformation (may be dataset-specific)
+            c2w = np.linalg.inv(c2w)
+            c2w[:3, 3] *= 1.5
+            swap_axes = np.array([
+                [0, 0, -1, 0],
+                [0, 1, 0, 0],
+                [-1, 0, 0, 0],
+                [0, 0, 0, 1]
+            ])
+            c2w = swap_axes @ c2w @ np.linalg.inv(swap_axes)
         self.c2w_mat = c2w
         self.w2c_mat = np.linalg.inv(c2w)
+
+
+class RawCamera(object):
+    """
+    Simple camera pose wrapper without coordinate transformations.
+    Use this for direct rendering with pre-computed c2w matrices.
+    """
+    def __init__(self, c2w):
+        """
+        Args:
+            c2w: 4x4 camera-to-world matrix
+        """
+        self.c2w_mat = np.array(c2w).reshape(4, 4)
+        self.w2c_mat = np.linalg.inv(self.c2w_mat)
+
+
+def create_intrinsic_provider(scene_path: str, offset: str,
+                             provider: CameraPoseProvider = None) -> Callable:
+    """
+    Create a function that provides intrinsics for any camera name.
+
+    Args:
+        scene_path: Path to scene directory
+        offset: Offset string (e.g., "0.0m")
+        provider: CameraPoseProvider instance (creates global if None)
+
+    Returns:
+        Function that takes camera_name and returns 3x3 intrinsic matrix
+    """
+    if provider is None:
+        provider = CameraPoseProvider(cache_params=True)
+
+    # Pre-load all intrinsics
+    all_intrinsics = get_all_camera_intrinsics(scene_path, offset, provider)
+
+    def intrinsic_provider(camera_name: str) -> np.ndarray:
+        """
+        Get intrinsic matrix for a camera.
+
+        Args:
+            camera_name: Full camera name (e.g., "CAM_PBQ_FRONT_WIDE_RESET_OPTICAL_H110")
+                        or short name (e.g., "FRONT_WIDE_RESET_OPTICAL_H110")
+
+        Returns:
+            3x3 intrinsic matrix
+        """
+        # Try full name first
+        if camera_name in all_intrinsics:
+            return all_intrinsics[camera_name]
+
+        # Try with prefix
+        full_name = f"CAM_PBQ_{camera_name}"
+        if full_name in all_intrinsics:
+            return all_intrinsics[full_name]
+
+        # Default to first camera
+        return next(iter(all_intrinsics.values()))
+
+    return intrinsic_provider
 
 
 # ============================================================
@@ -268,6 +352,10 @@ def parse_scene_structure(scene_root: str):
     """
     解析一个场景的目录结构
 
+    Supports two directory structures:
+    1. With trajectory: scene_root/{traj_id}/{sequence}_offset_{offset}/
+    2. Without trajectory: scene_root/{sequence}_offset_{offset}/
+
     Returns:
         trajectories: dict
             {
@@ -286,29 +374,84 @@ def parse_scene_structure(scene_root: str):
     """
     trajectories = {}
 
-    for traj_name in sorted(os.listdir(scene_root)):
-        traj_path = os.path.join(scene_root, traj_name)
-        if not os.path.isdir(traj_path) or traj_name.endswith('.zip'):
-            continue
-        # 跳过非轨迹目录
-        if 'offset' in traj_name:
-            continue
+    # Check if directory structure has trajectory subdirectories
+    has_trajectories = False
+    for item in os.listdir(scene_root):
+        item_path = os.path.join(scene_root, item)
+        if os.path.isdir(item_path) and 'offset' not in item and not item.endswith('.zip'):
+            # This might be a trajectory directory
+            for subitem in os.listdir(item_path):
+                if 'offset' in subitem:
+                    has_trajectories = True
+                    break
+            if has_trajectories:
+                break
 
-        trajectories[traj_name] = {}
+    if has_trajectories:
+        # Structure 1: scene_root/{traj_id}/{sequence}_offset_{offset}/
+        for traj_name in sorted(os.listdir(scene_root)):
+            traj_path = os.path.join(scene_root, traj_name)
+            if not os.path.isdir(traj_path) or traj_name.endswith('.zip'):
+                continue
+            # Skip offset directories
+            if 'offset' in traj_name:
+                continue
 
-        for offset_dir in sorted(os.listdir(traj_path)):
-            offset_path = os.path.join(traj_path, offset_dir)
+            trajectories[traj_name] = {}
+
+            for offset_dir in sorted(os.listdir(traj_path)):
+                offset_path = os.path.join(traj_path, offset_dir)
+                if not os.path.isdir(offset_path):
+                    continue
+                if 'offset' not in offset_dir:
+                    continue
+
+                # Extract offset value
+                offset_match = offset_dir.split('offset_')[-1]  # e.g. "+1.0m"
+
+                trajectories[traj_name][offset_match] = {}
+
+                # Traverse timestamp directories
+                for ts_name in sorted(os.listdir(offset_path)):
+                    ts_path = os.path.join(offset_path, ts_name)
+                    if not os.path.isdir(ts_path):
+                        continue
+                    try:
+                        ts = int(ts_name)
+                    except ValueError:
+                        continue
+
+                    # Collect camera images
+                    cam_images = {}
+                    for fname in os.listdir(ts_path):
+                        if not fname.endswith('.jpg') and not fname.endswith('.png'):
+                            continue
+                        for cam_name in CAMERA_NAMES:
+                            if cam_name in fname:
+                                cam_images[cam_name] = os.path.join(ts_path, fname)
+                                break
+
+                    if cam_images:
+                        trajectories[traj_name][offset_match][ts] = cam_images
+    else:
+        # Structure 2: scene_root/{sequence}_offset_{offset}/ (no trajectory dir)
+        # Use a default trajectory ID
+        default_traj_id = os.path.basename(scene_root)
+        trajectories[default_traj_id] = {}
+
+        for offset_dir in sorted(os.listdir(scene_root)):
+            offset_path = os.path.join(scene_root, offset_dir)
             if not os.path.isdir(offset_path):
                 continue
             if 'offset' not in offset_dir:
                 continue
 
-            # 提取偏移量
-            offset_match = offset_dir.split('offset_')[-1]  # e.g. "+1.0m"
+            # Extract offset value
+            offset_match = offset_dir.split('offset_')[-1]  # e.g. "0.0m"
 
-            trajectories[traj_name][offset_match] = {}
+            trajectories[default_traj_id][offset_match] = {}
 
-            # 遍历时间戳目录
+            # Traverse timestamp directories
             for ts_name in sorted(os.listdir(offset_path)):
                 ts_path = os.path.join(offset_path, ts_name)
                 if not os.path.isdir(ts_path):
@@ -318,7 +461,7 @@ def parse_scene_structure(scene_root: str):
                 except ValueError:
                     continue
 
-                # 收集该时间戳下的所有相机图像
+                # Collect camera images
                 cam_images = {}
                 for fname in os.listdir(ts_path):
                     if not fname.endswith('.jpg') and not fname.endswith('.png'):
@@ -329,7 +472,7 @@ def parse_scene_structure(scene_root: str):
                             break
 
                 if cam_images:
-                    trajectories[traj_name][offset_match][ts] = cam_images
+                    trajectories[default_traj_id][offset_match][ts] = cam_images
 
     return trajectories
 
@@ -374,17 +517,22 @@ class LidarProjectionDataset(Dataset):
         width: int = 832,
         steps_per_epoch: int = 10000,
         # 渲染参数
-        renderer_type: str = "cpu",      # "cpu" 或 "o3d"
+        renderer_type: str = "o3d",      # "cpu" 或 "o3d"
         splat_size: int = 2,             # CPU 渲染的 splat 大小
         point_size: float = 3.0,         # O3D 渲染的点大小
         max_points: int = 3_000_000,     # 点云最大点数
         # 采样权重
         offset_weights: Dict[str, float] = None,   # {"0.0m": 1.0, "+1.0m": 0.5, ...}
-        camera_weights: Dict[str, float] = None,   # {"FRONT_WIDE_...": 1.0, ...}
+        camera_weights: Dict[str, float] = None,   # {"{"FRONT_WIDE_...": 1.0, ...}
         # 相机内参 (渲染投影时使用，需外部提供)
         render_intrinsic: np.ndarray = None,        # (3,3) 渲染用内参
+        intrinsic_provider: Callable = None,        # Function(camera_name) -> 3x3 intrinsic
         # 每个相机的 splat_size / point_size 可调
         camera_splat_sizes: Dict[str, int] = None,  # {"FRONT_WIDE_...": 3, ...}
+        # Camera pose provider instance
+        camera_pose_provider: CameraPoseProvider = None,
+        # Use raw c2w matrices (no coordinate transformations)
+        use_raw_c2w: bool = True,
     ):
         super().__init__()
 
@@ -400,6 +548,9 @@ class LidarProjectionDataset(Dataset):
         self.target_c2w_provider = target_c2w_provider
         self.target_cam_json_key = target_cam_json_key
         self.source_cam_json_key = source_cam_json_key
+        self.intrinsic_provider = intrinsic_provider
+        self.camera_pose_provider = camera_pose_provider or CameraPoseProvider(cache_params=True)
+        self.use_raw_c2w = use_raw_c2w
 
         # 读取场景列表
         self.scene_df = pd.read_csv(scene_csv_path)
@@ -536,14 +687,17 @@ class LidarProjectionDataset(Dataset):
         probs = probs / probs.sum()
         return np.random.choice(names, p=probs)
 
-    def _render_single_frame(self, renderer, c2w: np.ndarray, cam_name: str = None):
+    def _render_single_frame(self, renderer, c2w: np.ndarray, cam_name: str = None,
+                            scene_path: str = None, offset: str = None):
         """
         渲染单帧
 
         Args:
             renderer: CPUPointCloudRenderer 或 O3DPointCloudRenderer
             c2w: (4, 4) camera-to-world
-            cam_name: 相机名 (用于获取该相机特定的 splat_size)
+            cam_name: 相机名 (用于获取该相机特定的 splat_size 和内参)
+            scene_path: 场景路径 (用于获取相机内参)
+            offset: 偏移量 (用于获取相机内参)
 
         Returns:
             color: (3, H, W) float32 [0, 1]
@@ -551,17 +705,25 @@ class LidarProjectionDataset(Dataset):
         """
         w2c = np.linalg.inv(c2w).astype(np.float32)
 
+        # Get camera-specific intrinsics if available
+        intrinsic = self.render_intrinsic
+        if self.intrinsic_provider is not None and cam_name is not None:
+            try:
+                intrinsic = self.intrinsic_provider(cam_name)
+            except:
+                pass  # Use default intrinsic
+
         if isinstance(renderer, O3DPointCloudRenderer):
             ps = self.camera_splat_sizes.get(cam_name, self.point_size) if cam_name else self.point_size
             return renderer.render(
-                self.render_intrinsic, w2c,
+                intrinsic, w2c,
                 self.height, self.width,
                 point_size=ps, return_mask=True
             )
         else:
             ss = self.camera_splat_sizes.get(cam_name, self.splat_size) if cam_name else self.splat_size
             return renderer.render(
-                self.render_intrinsic, w2c,
+                intrinsic, w2c,
                 self.height, self.width,
                 splat_size=ss, return_mask=True
             )
@@ -621,12 +783,26 @@ class LidarProjectionDataset(Dataset):
         source_video = torch.stack(source_frames, dim=1)  # (3, T, H, W)
 
         # ---- 7. 获取目标相机 c2w (81帧) ----
-        # 接口: target_c2w_provider(scene_path, traj_id, offset, timestamps)
+        # 接口: target_c2w_provider(scene_path, traj_id, offset, timestamps, camera_type, camera_name)
         #        返回 (81, 4, 4) numpy array
+        # 构造完整相机名
+        full_source_cam = f"CAM_PBQ_{source_cam}" if not source_cam.startswith("CAM_PBQ_") else source_cam
+
         if self.target_c2w_provider is not None:
-            target_c2ws = self.target_c2w_provider(
-                scene_path, traj_id, offset, timestamps
-            )
+            # Try calling with camera_name parameter (for our provider)
+            try:
+                target_c2ws = self.target_c2w_provider(
+                    scene_path, traj_id, offset, timestamps,
+                    camera_type="target",
+                    camera_name=full_source_cam
+                )
+            except TypeError:
+                print(f"Warning: target_c2w_provider does not support camera_name parameter. "
+                      f"Falling back to provider without camera_name.")
+                # Fallback for providers without camera_name parameter
+                target_c2ws = self.target_c2w_provider(
+                    scene_path, traj_id, offset, timestamps
+                )
         else:
             # 从 cameras_extrinsics.json 加载 (fallback)
             cam_json_path = scene_info.get('cameras_json')
@@ -648,10 +824,17 @@ class LidarProjectionDataset(Dataset):
         # ---- 8. 获取源相机 c2w (用于计算 relative pose) ----
         if self.target_c2w_provider is not None:
             # 如果有 provider，也提供源相机
-            source_c2ws = self.target_c2w_provider(
-                scene_path, traj_id, offset, timestamps,
-                camera_type="source"
-            )
+            try:
+                source_c2ws = self.target_c2w_provider(
+                    scene_path, traj_id, offset, timestamps,
+                    camera_type="source",
+                    camera_name=full_source_cam
+                )
+            except TypeError:
+                print(f"Warning: target_c2w_provider does not support camera_name parameter for source. "
+                      f"Falling back to provider without camera_name for source.")
+                # Fallback: use target_c2ws for source
+                source_c2ws = target_c2ws.copy()
         else:
             if cam_json_path and os.path.exists(cam_json_path):
                 with open(cam_json_path, 'r') as f:
@@ -670,12 +853,26 @@ class LidarProjectionDataset(Dataset):
         # ---- 10. PLY 投影: 渲染 lidar_rgb + lidar_mask ----
         renderer = self._get_renderer(ply_path)
 
+        # Create intrinsic provider for this scene/offset
+        intrinsic_provider = None
+        if self.camera_pose_provider is not None:
+            intrinsic_provider = create_intrinsic_provider(
+                scene_path, offset, self.camera_pose_provider
+            )
+
         lidar_colors = []
         lidar_masks = []
 
         for fi in range(self.num_frames):
             c2w = target_c2ws[fi]
-            color, mask = self._render_single_frame(renderer, c2w, cam_name=source_cam)
+            # Temporarily set intrinsic provider for this sample
+            old_provider = self.intrinsic_provider
+            self.intrinsic_provider = intrinsic_provider
+            color, mask = self._render_single_frame(
+                renderer, c2w, cam_name=source_cam,
+                scene_path=scene_path, offset=offset
+            )
+            self.intrinsic_provider = old_provider  # Restore
             lidar_colors.append(torch.from_numpy(color))
             lidar_masks.append(torch.from_numpy(mask))
 
@@ -685,8 +882,13 @@ class LidarProjectionDataset(Dataset):
         # ---- 11. 计算 relative pose (每4帧采样) ----
         cam_idx = list(range(self.num_frames))[::4]
 
-        source_cam_params = [Camera(source_c2ws[i]) for i in range(self.num_frames)]
-        target_cam_params = [Camera(target_c2ws[i]) for i in range(self.num_frames)]
+        # Choose Camera class based on use_raw_c2w flag
+        if self.use_raw_c2w:
+            source_cam_params = [RawCamera(source_c2ws[i]) for i in range(self.num_frames)]
+            target_cam_params = [RawCamera(target_c2ws[i]) for i in range(self.num_frames)]
+        else:
+            source_cam_params = [Camera(source_c2ws[i]) for i in range(self.num_frames)]
+            target_cam_params = [Camera(target_c2ws[i]) for i in range(self.num_frames)]
 
         relative_poses = []
         for i in cam_idx:
@@ -790,25 +992,28 @@ def test_dataset():
     print("Testing LidarProjectionDataset")
     print("=" * 60)
 
-    # --- 简单的 c2w provider (测试用) ---
-    def dummy_c2w_provider(scene_path, traj_id, offset, timestamps,
-                           camera_type="target"):
-        """
-        测试用: 生成围绕原点旋转的相机轨迹
-        实际使用时替换为真实外参加载
-        """
-        n = len(timestamps)
-        c2ws = []
-        for i in range(n):
-            theta = np.radians(i * 2)  # 每帧旋转2度
-            c2w = np.eye(4, dtype=np.float32)
-            c2w[0, 0] = np.cos(theta)
-            c2w[0, 2] = np.sin(theta)
-            c2w[2, 0] = -np.sin(theta)
-            c2w[2, 2] = np.cos(theta)
-            c2w[2, 3] = 10  # 距原点 10m
-            c2ws.append(c2w)
-        return np.array(c2ws, dtype=np.float32)
+    # --- c2w provider ---
+    # 使用真实的相机姿态 provider
+    from src.utils.camera_pose_provider import (
+        CameraPoseProvider,
+        create_per_sample_camera_provider,
+        create_intrinsic_provider
+    )
+
+    # 创建全局 provider
+    pose_provider = CameraPoseProvider(cache_params=True)
+
+    # 创建 per-sample provider (根据采样的相机名动态获取 c2w)
+    class PerSampleC2WProvider:
+        def __call__(self, scene_path, traj_id, offset, timestamps,
+                     camera_type="target", camera_name=None):
+            if camera_name is None:
+                camera_name = "CAM_PBQ_FRONT_WIDE_RESET_OPTICAL_H110"
+            return pose_provider.get_camera_c2ws(
+                scene_path, traj_id, offset, timestamps, camera_name
+            )
+
+    c2w_provider = PerSampleC2WProvider()
 
     # --- 创建 Dataset ---
     print("\nCreating dataset...")
@@ -816,7 +1021,8 @@ def test_dataset():
 
     dataset = LidarProjectionDataset(
         scene_csv_path=args.scene_csv,
-        target_c2w_provider=dummy_c2w_provider,
+        target_c2w_provider=c2w_provider,
+        camera_pose_provider=pose_provider,
         num_frames=args.num_frames,
         height=args.height,
         width=args.width,
@@ -830,6 +1036,7 @@ def test_dataset():
     print(f"  Scenes: {len(dataset.valid_scenes)}")
     print(f"  Renderer: {args.renderer}")
     print(f"  Splat/Point size: {args.splat_size}/{args.point_size}")
+    print(f"  Using real camera poses from camera_params.json")
 
     # --- 逐样本测试 ---
     load_times = []
